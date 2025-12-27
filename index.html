@@ -9,10 +9,10 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, setDoc, onSnapshot, updateDoc, collection, deleteDoc, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, doc, setDoc, onSnapshot, updateDoc, collection, deleteDoc, getDoc, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // ==========================================
-        //  FIREBASE CONFIGURATION SECTION
+        //  FIREBASE CONFIGURATION
         // ==========================================
         const myPersonalConfig = {
             apiKey: "AIzaSyCNFhph9nTvshmrp1nuJC1o53TD-Nknhb8",
@@ -34,7 +34,6 @@
                 app = initializeApp(finalConfig);
                 auth = getAuth(app);
                 db = getFirestore(app);
-                console.log("Firebase initialized successfully.");
             } catch (e) {
                 console.error("Firebase config error:", e);
             }
@@ -50,14 +49,14 @@
         const GRAVITY = 0.8;
 
         let gameState = {
-            mode: 'menu', 
+            mode: 'menu', // 'menu', 'nameEntry', 'matchmaking', 'challenge', 'playing', 'gameover'
             roomId: '',
             role: null, 
             playerName: '',
-            userId: 'local-user-' + Math.random().toString(36).substr(2, 5),
+            userId: null,
             players: {
-                p1: { name: 'Zeus 1', x: 100, y: 300, vy: 0, health: MAX_HEALTH, score: 0, facing: 1, action: 'idle' },
-                p2: { name: 'Zeus 2', x: 600, y: 300, vy: 0, health: MAX_HEALTH, score: 0, facing: -1, action: 'idle' }
+                p1: { name: 'Zeus 1', x: 100, y: 300, vy: 0, health: MAX_HEALTH, score: 0, facing: 1, action: 'idle', ready: false },
+                p2: { name: 'Zeus 2', x: 600, y: 300, vy: 0, health: MAX_HEALTH, score: 0, facing: -1, action: 'idle', ready: false }
             },
             bolts: [],
             isBot: true,
@@ -69,11 +68,23 @@
 
         const canvas = document.getElementById('gameCanvas');
         const ctx = canvas.getContext('2d');
-        const lobbyEl = document.getElementById('lobby');
-        const menuEl = document.getElementById('menu');
-        const nameEl = document.getElementById('nameEntry');
-        const hudEl = document.getElementById('hud');
-        const mobileControls = document.getElementById('mobileControls');
+        
+        const uiScreens = ['menu', 'nameEntry', 'matchmaking', 'challenge', 'hud', 'mobileControls'];
+        function showScreen(screenId) {
+            uiScreens.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) {
+                    if (id === screenId || (screenId === 'playing' && (id === 'hud' || id === 'mobileControls'))) {
+                        el.classList.remove('hidden');
+                    } else if (id !== 'mobileControls' || window.innerWidth >= 800) {
+                        el.classList.add('hidden');
+                    }
+                }
+            });
+            if (screenId === 'playing' && window.innerWidth < 800) {
+                document.getElementById('mobileControls').classList.remove('hidden');
+            }
+        }
 
         async function init() {
             if (auth) {
@@ -95,106 +106,137 @@
             requestAnimationFrame(gameLoop);
         }
 
+        window.goToNameEntry = () => {
+            gameState.isBot = false;
+            showScreen('nameEntry');
+        };
+
         window.submitName = () => {
             const name = document.getElementById('userNameInput').value.trim();
             if (!name) return alert("Please enter a name!");
             gameState.playerName = name;
-            nameEl.classList.add('hidden');
-            lobbyEl.classList.remove('hidden');
+            startMatchmaking();
         };
 
-        window.joinRoom = async (id) => {
-            if (!id || !db) {
-                if (!db) alert("Please set up your Firebase Config in the code to enable Multiplayer!");
-                return;
-            }
-            gameState.roomId = id;
-            gameState.isBot = false;
+        async function startMatchmaking() {
+            if (!db) return alert("Database not connected!");
+            showScreen('matchmaking');
             
+            const matchmakingRef = doc(db, 'artifacts', appId, 'public', 'data', 'matchmaking', 'global_queue');
+            
+            try {
+                // Simplified Matchmaking logic using a dedicated queue document
+                const snap = await getDoc(matchmakingRef);
+                const data = snap.exists() ? snap.data() : null;
+
+                if (data && data.roomId && (Date.now() - data.timestamp < 10000)) {
+                    // Join existing room
+                    const rId = data.roomId;
+                    await setDoc(matchmakingRef, { roomId: null, timestamp: Date.now() }); // Clear queue
+                    joinRoom(rId, 'p2');
+                } else {
+                    // Create new room
+                    const rId = "room_" + Math.random().toString(36).substr(2, 9);
+                    await setDoc(matchmakingRef, { roomId: rId, timestamp: Date.now() });
+                    joinRoom(rId, 'p1');
+                }
+            } catch (e) {
+                console.error("Matchmaking error:", e);
+                // Fallback: just join a static room if queue fails
+                joinRoom("global_arena", 'p1');
+            }
+        }
+
+        async function joinRoom(id, role) {
+            gameState.roomId = id;
+            gameState.role = role;
             const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', id);
             
-            const docSnap = await getDoc(roomRef);
-            if (!docSnap.exists()) {
-                // I am Player 1
-                gameState.role = 'p1';
+            if (role === 'p1') {
                 gameState.players.p1.name = gameState.playerName;
                 await setDoc(roomRef, {
                     p1: gameState.userId,
-                    p1Name: gameState.playerName,
                     p2: null,
-                    p2Name: null,
                     state: gameState.players,
                     lastBolt: null,
                     timestamp: Date.now()
                 });
             } else {
-                const data = docSnap.data();
-                if (data.p1 === gameState.userId) {
-                    gameState.role = 'p1';
-                } else {
-                    // I am Player 2
-                    gameState.role = 'p2';
-                    gameState.players.p2.name = gameState.playerName;
-                    await updateDoc(roomRef, { 
-                        p2: gameState.userId,
-                        p2Name: gameState.playerName,
-                        'state.p2.name': gameState.playerName
-                    });
-                }
+                gameState.players.p2.name = gameState.playerName;
+                await updateDoc(roomRef, { 
+                    p2: gameState.userId,
+                    'state.p2.name': gameState.playerName,
+                    'state.p2.ready': false
+                });
             }
 
             onSnapshot(roomRef, (snap) => {
                 if (!snap.exists()) return;
                 const data = snap.data();
                 
-                // Track if opponent has joined
                 gameState.opponentJoined = !!(data.p1 && data.p2);
-                
                 const otherRole = gameState.role === 'p1' ? 'p2' : 'p1';
                 const myRole = gameState.role;
 
-                // Sync Opponent Data
-                if (data.state && data.state[otherRole]) {
-                    const remoteOpponent = data.state[otherRole];
-                    gameState.players[otherRole] = { 
-                        ...gameState.players[otherRole], 
-                        ...remoteOpponent 
-                    };
+                if (data.state) {
+                    // SYNC OPPONENT
+                    if (data.state[otherRole]) {
+                        const remoteOpponent = data.state[otherRole];
+                        gameState.players[otherRole] = { ...gameState.players[otherRole], ...remoteOpponent };
+                    }
+                    // SYNC MY SCORE/READY (Authority is the DB for these meta states)
+                    if (data.state[myRole]) {
+                        gameState.players[myRole].score = data.state[myRole].score;
+                        gameState.players[myRole].ready = data.state[myRole].ready;
+                    }
                 }
 
-                // Sync Global Scores & Round (only update my local view)
-                if (data.state && data.state[myRole]) {
-                    gameState.players[myRole].score = data.state[myRole].score;
-                }
-
-                // Handle incoming bolts
                 if (data.lastBolt && data.lastBolt.owner !== gameState.role && data.lastBolt.id !== gameState.lastHandledBoltId) {
                     spawnBolt(data.lastBolt.owner, data.lastBolt.x, data.lastBolt.y, data.lastBolt.dir);
                     gameState.lastHandledBoltId = data.lastBolt.id;
                 }
-            });
 
-            startGame();
+                // Transition to Challenge or Playing
+                if (gameState.opponentJoined) {
+                    if (gameState.players.p1.ready && gameState.players.p2.ready) {
+                        if (gameState.mode !== 'playing') showScreen('playing');
+                        gameState.mode = 'playing';
+                    } else {
+                        if (gameState.mode !== 'challenge') {
+                            showScreen('challenge');
+                            document.getElementById('oppName').innerText = gameState.players[otherRole].name;
+                        }
+                        gameState.mode = 'challenge';
+                    }
+                }
+            });
+        }
+
+        window.acceptChallenge = () => {
+            if (!gameState.role) return;
+            gameState.players[gameState.role].ready = true;
+            syncMyState();
         };
 
         function syncMyState() {
-            if (!db || !gameState.roomId || !gameState.role || gameState.role === 'spectator') return;
+            if (!db || !gameState.roomId || !gameState.role) return;
             const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', gameState.roomId);
             const p = gameState.players[gameState.role];
             
-            // Only update MY specific part of the object to avoid overwriting opponent's health changes
+            // Only sync what WE control. We never sync health unless it's a hit we received.
             updateDoc(roomRef, {
                 [`state.${gameState.role}.x`]: p.x,
                 [`state.${gameState.role}.y`]: p.y,
-                [`state.${gameState.role}.health`]: p.health,
+                [`state.${gameState.role}.health`]: p.health, // This is okay because only WE update our own health
                 [`state.${gameState.role}.action`]: p.action,
                 [`state.${gameState.role}.facing`]: p.facing,
-                [`state.${gameState.role}.score`]: p.score
+                [`state.${gameState.role}.score`]: p.score,
+                [`state.${gameState.role}.ready`]: p.ready
             });
         }
 
         function syncBolt(x, y, dir) {
-            if (!db || !gameState.roomId || gameState.role === 'spectator') return;
+            if (!db || !gameState.roomId) return;
             const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', gameState.roomId);
             updateDoc(roomRef, {
                 lastBolt: { id: Math.random().toString(36), owner: gameState.role, x, y, dir }
@@ -210,7 +252,7 @@
         }
 
         function handleInput() {
-            if (gameState.mode !== 'playing' || (!gameState.isBot && !gameState.opponentJoined)) return;
+            if (gameState.mode !== 'playing') return;
             const roleKey = gameState.isBot ? 'p1' : (gameState.role || 'p1');
             const p = gameState.players[roleKey];
             
@@ -226,9 +268,10 @@
                 setTimeout(() => p.cooldown = false, 600);
             }
 
-            p.action = moved ? 'move' : 'idle';
+            p.action = (keys['ArrowLeft'] || keys['ArrowRight']) ? 'move' : 'idle';
             if (p.y < 300) p.action = 'jump';
             p.x = Math.max(0, Math.min(CANVAS_WIDTH - 40, p.x));
+            
             if (moved && !gameState.isBot) syncMyState();
         }
 
@@ -248,7 +291,6 @@
 
         function update() {
             if (gameState.mode !== 'playing') return;
-            if (!gameState.isBot && !gameState.opponentJoined) return;
 
             ['p1', 'p2'].forEach(key => {
                 const p = gameState.players[key];
@@ -313,7 +355,6 @@
             ctx.translate(p.x + 20, p.y + 30);
             if (p.facing === -1) ctx.scale(-1, 1);
             
-            // Draw Name Tag
             ctx.scale(p.facing === -1 ? -1 : 1, 1);
             ctx.fillStyle = '#fff';
             ctx.font = 'bold 12px sans-serif';
@@ -329,43 +370,31 @@
             ctx.beginPath(); ctx.arc(0, -25, 12, 0, Math.PI * 2); ctx.fill();
             ctx.fillStyle = '#fff'; 
             ctx.beginPath(); ctx.moveTo(-10, -20); ctx.lineTo(10, -20); ctx.lineTo(0, 0); ctx.fill();
-            ctx.shadowBlur = 15;
-            ctx.shadowColor = color;
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 2;
+            ctx.shadowBlur = 15; ctx.shadowColor = color; ctx.strokeStyle = color; ctx.lineWidth = 2;
             ctx.strokeRect(-20, -40, 40, 70);
             ctx.restore();
         }
 
         function drawBolt(bolt) {
             ctx.save();
-            ctx.strokeStyle = '#0ff';
-            ctx.lineWidth = 3;
-            ctx.shadowBlur = 20;
-            ctx.shadowColor = '#0ff';
+            ctx.strokeStyle = '#0ff'; ctx.lineWidth = 3; ctx.shadowBlur = 20; ctx.shadowColor = '#0ff';
             ctx.beginPath();
-            let bx = bolt.x;
-            let by = bolt.y;
+            let bx = bolt.x; let by = bolt.y;
             ctx.moveTo(bx, by);
-            for(let i=0; i<5; i++) {
-                bx += bolt.dir * 10;
-                by += (Math.random() - 0.5) * 20;
-                ctx.lineTo(bx, by);
-            }
+            for(let i=0; i<5; i++) { bx += bolt.dir * 10; by += (Math.random() - 0.5) * 20; ctx.lineTo(bx, by); }
             ctx.stroke();
             ctx.restore();
         }
 
         function draw() {
             const grad = ctx.createLinearGradient(0,0,0,CANVAS_HEIGHT);
-            grad.addColorStop(0, '#001');
-            grad.addColorStop(1, '#112');
+            grad.addColorStop(0, '#001'); grad.addColorStop(1, '#112');
             ctx.fillStyle = grad;
             ctx.fillRect(0,0,CANVAS_WIDTH, CANVAS_HEIGHT);
             ctx.fillStyle = '#223';
             ctx.fillRect(0, 360, CANVAS_WIDTH, 90);
 
-            if (gameState.mode === 'playing' || gameState.mode === 'gameover') {
+            if (gameState.mode === 'playing' || gameState.mode === 'challenge' || gameState.mode === 'gameover') {
                 drawZeus(gameState.players.p1, '#0af');
                 drawZeus(gameState.players.p2, '#f0a');
                 gameState.bolts.forEach(drawBolt);
@@ -375,29 +404,15 @@
                 document.getElementById('p1-name-display').innerText = gameState.players.p1.name;
                 document.getElementById('p2-name-display').innerText = gameState.players.p2.name;
                 document.getElementById('round-text').innerText = `Round ${gameState.round} | Score: ${gameState.players.p1.score} - ${gameState.players.p2.score}`;
-
-                // Waiting Overlay
-                if (!gameState.isBot && !gameState.opponentJoined) {
-                    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-                    ctx.fillRect(0,0,CANVAS_WIDTH, CANVAS_HEIGHT);
-                    ctx.fillStyle = '#fff';
-                    ctx.font = '24px sans-serif';
-                    ctx.textAlign = 'center';
-                    ctx.fillText('Waiting for opponent to join...', CANVAS_WIDTH/2, CANVAS_HEIGHT/2);
-                    ctx.font = '14px sans-serif';
-                    ctx.fillText(`Share Room ID: ${gameState.roomId}`, CANVAS_WIDTH/2, CANVAS_HEIGHT/2 + 40);
-                }
             }
 
             if (gameState.mode === 'gameover') {
                 ctx.fillStyle = 'rgba(0,0,0,0.8)';
                 ctx.fillRect(0,0,CANVAS_WIDTH, CANVAS_HEIGHT);
                 ctx.fillStyle = '#fff';
-                ctx.font = 'bold 40px sans-serif';
-                ctx.textAlign = 'center';
+                ctx.font = 'bold 40px sans-serif'; ctx.textAlign = 'center';
                 ctx.fillText(`${gameState.players[gameState.winner].name} WINS!`, CANVAS_WIDTH/2, CANVAS_HEIGHT/2);
-                ctx.font = '20px sans-serif';
-                ctx.fillText('Click to restart', CANVAS_WIDTH/2, CANVAS_HEIGHT/2 + 50);
+                ctx.font = '20px sans-serif'; ctx.fillText('Click to restart', CANVAS_WIDTH/2, CANVAS_HEIGHT/2 + 50);
             }
         }
 
@@ -411,17 +426,9 @@
             gameState.isBot = true; 
             gameState.players.p1.name = "You";
             gameState.players.p2.name = "Bot";
-            startGame(); 
-        };
-
-        function startGame() {
+            showScreen('playing');
             gameState.mode = 'playing';
-            menuEl.classList.add('hidden');
-            lobbyEl.classList.add('hidden');
-            nameEl.classList.add('hidden');
-            hudEl.classList.remove('hidden');
-            if (window.innerWidth < 800) mobileControls.classList.remove('hidden');
-        }
+        };
 
         window.handleMove = (dir) => { 
             if (dir === 0) { keys['ArrowLeft'] = false; keys['ArrowRight'] = false; }
@@ -458,35 +465,43 @@
             </div>
         </div>
     </div>
+
     <canvas id="gameCanvas" width="800" height="450" class="rounded-xl shadow-2xl shadow-blue-900/20"></canvas>
     
-    <!-- Menu Screen -->
+    <!-- Menu -->
     <div id="menu" class="absolute inset-0 z-10 flex items-center justify-center bg-black/80 p-6">
-        <div class="bg-gray-900 border-2 border-yellow-500 p-8 rounded-2xl text-center max-w-sm w-full shadow-2xl shadow-yellow-500/10">
+        <div class="bg-gray-900 border-2 border-yellow-500 p-8 rounded-2xl text-center max-w-sm w-full shadow-2xl">
             <h1 class="text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 to-blue-500 mb-6 italic uppercase tracking-tighter">Lightning Wars</h1>
-            <p class="text-gray-400 mb-8">Master the power of Zeus. Duel with friends or test your skills against AI.</p>
-            <button onclick="startBotGame()" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-4 px-6 rounded-xl mb-4 transition transform active:scale-95 shadow-lg shadow-blue-600/20">Play vs Bot</button>
-            <button onclick="document.getElementById('menu').classList.add('hidden'); document.getElementById('nameEntry').classList.remove('hidden')" class="w-full bg-yellow-500 hover:bg-yellow-400 text-black font-bold py-4 px-6 rounded-xl transition transform active:scale-95 shadow-lg shadow-yellow-500/20">Multiplayer Lobby</button>
+            <button onclick="startBotGame()" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-4 px-6 rounded-xl mb-4 shadow-lg shadow-blue-600/20">Play vs Bot</button>
+            <button onclick="goToNameEntry()" class="w-full bg-yellow-500 hover:bg-yellow-400 text-black font-bold py-4 px-6 rounded-xl shadow-lg shadow-yellow-500/20">Multiplayer Battle</button>
         </div>
     </div>
 
-    <!-- Name Entry Screen -->
+    <!-- Name Entry -->
     <div id="nameEntry" class="hidden absolute inset-0 z-10 flex items-center justify-center bg-black/80 p-6">
         <div class="bg-gray-900 border-2 border-blue-500 p-8 rounded-2xl text-center max-w-sm w-full shadow-2xl">
-            <h2 class="text-2xl font-bold text-white mb-4">Enter Your Name</h2>
-            <input id="userNameInput" type="text" maxlength="10" placeholder="Your Zeus Name" class="w-full bg-gray-800 border border-gray-700 text-white p-4 rounded-xl mb-4 focus:outline-none focus:border-blue-500 text-center">
-            <button onclick="submitName()" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-4 px-6 rounded-xl mb-4">Continue</button>
+            <h2 class="text-2xl font-bold text-white mb-4 italic uppercase">Enter Warrior Name</h2>
+            <input id="userNameInput" type="text" maxlength="10" placeholder="Zeus Jr" class="w-full bg-gray-800 border border-gray-700 text-white p-4 rounded-xl mb-4 focus:outline-none focus:border-blue-500 text-center uppercase font-bold">
+            <button onclick="submitName()" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-4 px-6 rounded-xl">Enter Arena</button>
         </div>
     </div>
 
-    <!-- Lobby Screen -->
-    <div id="lobby" class="hidden absolute inset-0 z-10 flex items-center justify-center bg-black/80 p-6">
+    <!-- Matchmaking -->
+    <div id="matchmaking" class="hidden absolute inset-0 z-10 flex items-center justify-center bg-black/80 p-6">
         <div class="bg-gray-900 border-2 border-blue-500 p-8 rounded-2xl text-center max-w-sm w-full shadow-2xl">
-            <h2 class="text-2xl font-bold text-white mb-4">Multiplayer Lobby</h2>
-            <p class="text-gray-400 mb-6 text-sm">Enter a Room ID and share it with a friend!</p>
-            <input id="roomInput" type="text" placeholder="Room ID" class="w-full bg-gray-800 border border-gray-700 text-white p-4 rounded-xl mb-4 focus:outline-none focus:border-blue-500 text-center uppercase">
-            <button onclick="joinRoom(document.getElementById('roomInput').value.toUpperCase())" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-4 px-6 rounded-xl mb-4">Join Battle</button>
-            <button onclick="document.getElementById('lobby').classList.add('hidden'); document.getElementById('menu').classList.remove('hidden')" class="text-gray-500 text-sm underline">Back to Menu</button>
+            <div class="animate-spin w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full mx-auto mb-4"></div>
+            <h2 class="text-2xl font-bold text-white mb-2 italic uppercase">Searching...</h2>
+            <p class="text-gray-400 text-sm">Looking for a worthy opponent in the clouds.</p>
+        </div>
+    </div>
+
+    <!-- Challenge UI -->
+    <div id="challenge" class="hidden absolute inset-0 z-10 flex items-center justify-center bg-black/80 p-6">
+        <div class="bg-gray-900 border-2 border-pink-500 p-8 rounded-2xl text-center max-w-sm w-full shadow-2xl">
+            <h2 class="text-3xl font-black text-white mb-2 italic uppercase tracking-widest text-pink-500">Opponent Found!</h2>
+            <p class="text-white text-xl mb-6 font-bold" id="oppName">Opponent</p>
+            <button onclick="acceptChallenge()" class="w-full bg-pink-600 hover:bg-pink-500 text-white font-black py-6 px-6 rounded-xl text-2xl animate-pulse">ACCEPT CHALLENGE</button>
+            <p class="mt-4 text-xs text-gray-500 uppercase tracking-widest">Both warriors must accept to begin</p>
         </div>
     </div>
 
@@ -498,7 +513,7 @@
         </div>
         <div class="flex flex-col gap-2 pointer-events-auto items-end">
             <button ontouchstart="handleJump()" class="touch-btn w-20 h-20 bg-blue-600/50 rounded-full flex items-center justify-center border-2 border-blue-400 active:scale-90 text-white font-bold">JUMP</button>
-            <button ontouchstart="handleShoot()" class="touch-btn w-24 h-24 bg-yellow-500/50 rounded-full flex items-center justify-center border-2 border-yellow-400 active:scale-90 text-black font-bold">BOLT</button>
+            <button ontouchstart="handleShoot()" class="touch-btn w-24 h-24 bg-yellow-500/50 rounded-full flex items-center justify-center border-2 border-yellow-400 active:scale-90 text-black font-bold uppercase">Bolt</button>
         </div>
     </div>
 </body>
