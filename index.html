@@ -25,7 +25,6 @@
         };
 
         let app, auth, db;
-        // Fallback logic to keep it working in both Gemini and your personal host
         const envConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
         const finalConfig = myPersonalConfig || envConfig;
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'lightning-wars-v1';
@@ -76,10 +75,7 @@
         async function init() {
             if (auth) {
                 try {
-                    // CRITICAL FIX: Only use the custom token if we are using the environment's default config.
-                    // If myPersonalConfig is provided, the environment's token will cause a mismatch error.
                     const isUsingEnvConfig = !myPersonalConfig && !!envConfig;
-                    
                     if (isUsingEnvConfig && typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
                         await signInWithCustomToken(auth, __initial_auth_token);
                     } else {
@@ -90,7 +86,6 @@
                     });
                 } catch (err) {
                     console.error("Auth error:", err);
-                    // Final fallback to ensure the game starts even if auth fails
                     try { await signInAnonymously(auth); } catch(e) {}
                 }
             }
@@ -142,11 +137,17 @@
         };
 
         function syncMyState() {
-            if (!db || !gameState.roomId || gameState.role === 'spectator') return;
+            if (!db || !gameState.roomId || !gameState.role || gameState.role === 'spectator') return;
             const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', gameState.roomId);
             const myState = gameState.players[gameState.role];
             updateDoc(roomRef, {
-                [`state.${gameState.role}`]: { x: myState.x, y: myState.y, health: myState.health, action: myState.action, facing: myState.facing }
+                [`state.${gameState.role}`]: { 
+                    x: myState.x, 
+                    y: myState.y, 
+                    health: myState.health, 
+                    action: myState.action, 
+                    facing: myState.facing 
+                }
             });
         }
 
@@ -211,18 +212,34 @@
                 if (p.y < 300) p.vy += GRAVITY;
                 else { p.y = 300; p.vy = 0; }
             });
+
             gameState.bolts.forEach((bolt) => {
                 bolt.x += bolt.dir * BOLT_SPEED;
                 const targetKey = bolt.owner === 'p1' ? 'p2' : 'p1';
                 const target = gameState.players[targetKey];
+
+                // Collision Detection
                 if (bolt.active && bolt.x > target.x && bolt.x < target.x + 40 && bolt.y > target.y && bolt.y < target.y + 60) {
-                    target.health--;
                     bolt.active = false;
-                    checkRoundEnd();
+                    
+                    if (gameState.isBot) {
+                        // In Bot mode, we manage both locally
+                        target.health--;
+                        checkRoundEnd();
+                    } else {
+                        // In Multiplayer, only confirm damage if WE are the target
+                        // This prevents stale state from the other player overwriting the hit
+                        if (targetKey === gameState.role) {
+                            target.health--;
+                            syncMyState(); // Sync health immediately
+                            checkRoundEnd();
+                        }
+                    }
                 }
                 if (bolt.x < -100 || bolt.x > CANVAS_WIDTH + 100) bolt.active = false;
             });
             gameState.bolts = gameState.bolts.filter(b => b.active);
+
             handleInput();
             if (gameState.isBot) updateBot();
         }
@@ -245,8 +262,13 @@
             gameState.players.p2.health = MAX_HEALTH;
             gameState.players.p1.x = 100;
             gameState.players.p2.x = 600;
+            gameState.players.p1.vy = 0;
+            gameState.players.p2.vy = 0;
             gameState.bolts = [];
             gameState.round++;
+            
+            // Sync the reset state for everyone
+            if (!gameState.isBot) syncMyState();
         }
 
         function drawZeus(p, color) {
