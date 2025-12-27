@@ -43,7 +43,7 @@
         const CANVAS_WIDTH = 800;
         const CANVAS_HEIGHT = 450;
         const MAX_HEALTH = 5;
-        const BOLT_SPEED = 8;
+        const BOLT_SPEED = 9;
         const MOVE_SPEED = 5;
         const JUMP_FORCE = -15;
         const GRAVITY = 0.8;
@@ -76,13 +76,10 @@
                 if (el) {
                     if (id === screenId || (screenId === 'playing' && (id === 'hud' || id === 'mobileControls'))) {
                         el.classList.remove('hidden');
+                    } else if (id === 'mobileControls' && window.innerWidth < 800 && (gameState.mode === 'playing' || gameState.mode === 'challenge')) {
+                        el.classList.remove('hidden');
                     } else {
-                        // Keep mobile controls always visible if on mobile
-                        if (id === 'mobileControls' && window.innerWidth < 800 && (gameState.mode === 'playing' || gameState.mode === 'challenge')) {
-                             el.classList.remove('hidden');
-                        } else {
-                             el.classList.add('hidden');
-                        }
+                        el.classList.add('hidden');
                     }
                 }
             });
@@ -131,7 +128,6 @@
                 const snap = await getDoc(matchmakingRef);
                 const data = snap.exists() ? snap.data() : null;
 
-                // If a room is in the queue and it's fresh (created in the last 15 seconds)
                 if (data && data.roomId && (Date.now() - data.timestamp < 15000)) {
                     const rId = data.roomId;
                     await setDoc(matchmakingRef, { roomId: null, timestamp: Date.now() });
@@ -166,7 +162,8 @@
                 await updateDoc(roomRef, { 
                     p2: gameState.userId,
                     'state.p2.name': gameState.playerName,
-                    'state.p2.ready': false
+                    'state.p2.ready': false,
+                    'state.p2.health': MAX_HEALTH
                 });
             }
 
@@ -179,16 +176,20 @@
                 const myRole = gameState.role;
 
                 if (data.state) {
-                    // Sync Opponent completely
+                    // Update opponent from DB
                     if (data.state[otherRole]) {
-                        gameState.players[otherRole] = { ...gameState.players[otherRole], ...data.state[otherRole] };
+                        const remoteOpp = data.state[otherRole];
+                        gameState.players[otherRole] = { ...gameState.players[otherRole], ...remoteOpp };
                     }
-                    // Sync My Meta-States (Score, Ready, but NOT Health/Position which I control)
+                    // Update MY non-physical attributes from DB (score, ready)
                     if (data.state[myRole]) {
                         gameState.players[myRole].score = data.state[myRole].score;
                         gameState.players[myRole].ready = data.state[myRole].ready;
-                        // Important: Only sync health from DB if it's strictly necessary (e.g., initial load)
-                        // but normally local is the authority.
+                        // Synchronize my own health IF it was changed (e.g. by a reset or load)
+                        // but during active play, local health is the source of truth
+                        if (gameState.mode === 'menu') {
+                            gameState.players[myRole].health = data.state[myRole].health;
+                        }
                     }
                 }
 
@@ -303,32 +304,34 @@
                 const targetKey = bolt.owner === 'p1' ? 'p2' : 'p1';
                 const target = gameState.players[targetKey];
 
-                // Improved hit detection area (center of Zeus character)
+                // Hit detection (Centered Box)
                 const charCenterX = target.x + 20;
                 const charCenterY = target.y + 30;
-                const hitBoxRadius = 35;
+                const hitBoxWidth = 45;
+                const hitBoxHeight = 70;
 
-                const dx = bolt.x - charCenterX;
-                const dy = (bolt.y) - charCenterY;
-                const distance = Math.sqrt(dx * dx + dy * dy);
-
-                if (bolt.active && distance < hitBoxRadius) {
-                    // Bolt hit a player
-                    bolt.active = false; // BOLT DISAPPEARS FOR EVERYONE
+                if (bolt.active && 
+                    bolt.x > charCenterX - hitBoxWidth/2 && 
+                    bolt.x < charCenterX + hitBoxWidth/2 && 
+                    bolt.y > charCenterY - hitBoxHeight/2 && 
+                    bolt.y < charCenterY + hitBoxHeight/2) {
+                    
+                    // BOLT ALWAYS DISAPPEARS ON HIT FOR ALL CLIENTS
+                    bolt.active = false;
 
                     if (gameState.isBot) {
                         target.health--;
                         checkRoundEnd();
                     } else if (targetKey === gameState.role) {
-                        // LOCAL AUTHORITY: Only I can take damage for myself
+                        // LOCAL AUTHORITY: Only I confirm my own damage
                         gameState.players[gameState.role].health--;
-                        console.log("Took damage! New health:", gameState.players[gameState.role].health);
-                        syncMyState(); // Update health in DB immediately
+                        console.log("Multiplayer Hit Detected! Syncing new health:", gameState.players[gameState.role].health);
+                        syncMyState(); 
                         checkRoundEnd();
                     }
                 }
 
-                if (bolt.x < -50 || bolt.x > CANVAS_WIDTH + 50) bolt.active = false;
+                if (bolt.x < -100 || bolt.x > CANVAS_WIDTH + 100) bolt.active = false;
             });
             gameState.bolts = gameState.bolts.filter(b => b.active);
 
@@ -366,7 +369,6 @@
             ctx.translate(p.x + 20, p.y + 30);
             if (p.facing === -1) ctx.scale(-1, 1);
             
-            // Name tag
             ctx.scale(p.facing === -1 ? -1 : 1, 1);
             ctx.fillStyle = '#fff';
             ctx.font = 'bold 12px sans-serif';
@@ -374,19 +376,14 @@
             ctx.fillText(p.name || 'Player', 0, -50);
             if (p.facing === -1) ctx.scale(-1, 1);
 
-            // Toga
             ctx.fillStyle = '#fff';
             ctx.beginPath();
             ctx.moveTo(-15, 30); ctx.lineTo(15, 30); ctx.lineTo(10, -10); ctx.lineTo(-10, -10);
             ctx.fill();
-            // Head
             ctx.fillStyle = '#f3e5ab';
             ctx.beginPath(); ctx.arc(0, -25, 12, 0, Math.PI * 2); ctx.fill();
-            // Beard
             ctx.fillStyle = '#fff'; 
             ctx.beginPath(); ctx.moveTo(-10, -20); ctx.lineTo(10, -20); ctx.lineTo(0, 0); ctx.fill();
-            
-            // Glow border
             ctx.shadowBlur = 15; ctx.shadowColor = color; ctx.strokeStyle = color; ctx.lineWidth = 2;
             ctx.strokeRect(-20, -40, 40, 70);
             ctx.restore();
@@ -412,8 +409,6 @@
             grad.addColorStop(0, '#001'); grad.addColorStop(1, '#112');
             ctx.fillStyle = grad;
             ctx.fillRect(0,0,CANVAS_WIDTH, CANVAS_HEIGHT);
-            
-            // Floor
             ctx.fillStyle = '#223';
             ctx.fillRect(0, 360, CANVAS_WIDTH, 90);
 
