@@ -49,7 +49,7 @@
         const GRAVITY = 0.8;
 
         let gameState = {
-            mode: 'menu', // 'menu', 'nameEntry', 'matchmaking', 'challenge', 'playing', 'gameover'
+            mode: 'menu', 
             roomId: '',
             role: null, 
             playerName: '',
@@ -76,14 +76,16 @@
                 if (el) {
                     if (id === screenId || (screenId === 'playing' && (id === 'hud' || id === 'mobileControls'))) {
                         el.classList.remove('hidden');
-                    } else if (id !== 'mobileControls' || window.innerWidth >= 800) {
-                        el.classList.add('hidden');
+                    } else {
+                        // Keep mobile controls always visible if on mobile
+                        if (id === 'mobileControls' && window.innerWidth < 800 && (gameState.mode === 'playing' || gameState.mode === 'challenge')) {
+                             el.classList.remove('hidden');
+                        } else {
+                             el.classList.add('hidden');
+                        }
                     }
                 }
             });
-            if (screenId === 'playing' && window.innerWidth < 800) {
-                document.getElementById('mobileControls').classList.remove('hidden');
-            }
         }
 
         async function init() {
@@ -120,30 +122,28 @@
 
         async function startMatchmaking() {
             if (!db) return alert("Database not connected!");
+            gameState.mode = 'matchmaking';
             showScreen('matchmaking');
             
             const matchmakingRef = doc(db, 'artifacts', appId, 'public', 'data', 'matchmaking', 'global_queue');
             
             try {
-                // Simplified Matchmaking logic using a dedicated queue document
                 const snap = await getDoc(matchmakingRef);
                 const data = snap.exists() ? snap.data() : null;
 
-                if (data && data.roomId && (Date.now() - data.timestamp < 10000)) {
-                    // Join existing room
+                // If a room is in the queue and it's fresh (created in the last 15 seconds)
+                if (data && data.roomId && (Date.now() - data.timestamp < 15000)) {
                     const rId = data.roomId;
-                    await setDoc(matchmakingRef, { roomId: null, timestamp: Date.now() }); // Clear queue
+                    await setDoc(matchmakingRef, { roomId: null, timestamp: Date.now() });
                     joinRoom(rId, 'p2');
                 } else {
-                    // Create new room
                     const rId = "room_" + Math.random().toString(36).substr(2, 9);
                     await setDoc(matchmakingRef, { roomId: rId, timestamp: Date.now() });
                     joinRoom(rId, 'p1');
                 }
             } catch (e) {
                 console.error("Matchmaking error:", e);
-                // Fallback: just join a static room if queue fails
-                joinRoom("global_arena", 'p1');
+                joinRoom("fallback_arena", 'p1');
             }
         }
 
@@ -179,15 +179,16 @@
                 const myRole = gameState.role;
 
                 if (data.state) {
-                    // SYNC OPPONENT
+                    // Sync Opponent completely
                     if (data.state[otherRole]) {
-                        const remoteOpponent = data.state[otherRole];
-                        gameState.players[otherRole] = { ...gameState.players[otherRole], ...remoteOpponent };
+                        gameState.players[otherRole] = { ...gameState.players[otherRole], ...data.state[otherRole] };
                     }
-                    // SYNC MY SCORE/READY (Authority is the DB for these meta states)
+                    // Sync My Meta-States (Score, Ready, but NOT Health/Position which I control)
                     if (data.state[myRole]) {
                         gameState.players[myRole].score = data.state[myRole].score;
                         gameState.players[myRole].ready = data.state[myRole].ready;
+                        // Important: Only sync health from DB if it's strictly necessary (e.g., initial load)
+                        // but normally local is the authority.
                     }
                 }
 
@@ -196,7 +197,6 @@
                     gameState.lastHandledBoltId = data.lastBolt.id;
                 }
 
-                // Transition to Challenge or Playing
                 if (gameState.opponentJoined) {
                     if (gameState.players.p1.ready && gameState.players.p2.ready) {
                         if (gameState.mode !== 'playing') showScreen('playing');
@@ -223,11 +223,10 @@
             const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', gameState.roomId);
             const p = gameState.players[gameState.role];
             
-            // Only sync what WE control. We never sync health unless it's a hit we received.
             updateDoc(roomRef, {
                 [`state.${gameState.role}.x`]: p.x,
                 [`state.${gameState.role}.y`]: p.y,
-                [`state.${gameState.role}.health`]: p.health, // This is okay because only WE update our own health
+                [`state.${gameState.role}.health`]: p.health, 
                 [`state.${gameState.role}.action`]: p.action,
                 [`state.${gameState.role}.facing`]: p.facing,
                 [`state.${gameState.role}.score`]: p.score,
@@ -304,20 +303,32 @@
                 const targetKey = bolt.owner === 'p1' ? 'p2' : 'p1';
                 const target = gameState.players[targetKey];
 
-                if (bolt.active && bolt.x > target.x && bolt.x < target.x + 40 && bolt.y > target.y && bolt.y < target.y + 60) {
-                    bolt.active = false;
-                    
+                // Improved hit detection area (center of Zeus character)
+                const charCenterX = target.x + 20;
+                const charCenterY = target.y + 30;
+                const hitBoxRadius = 35;
+
+                const dx = bolt.x - charCenterX;
+                const dy = (bolt.y) - charCenterY;
+                const distance = Math.sqrt(dx * dx + dy * dy);
+
+                if (bolt.active && distance < hitBoxRadius) {
+                    // Bolt hit a player
+                    bolt.active = false; // BOLT DISAPPEARS FOR EVERYONE
+
                     if (gameState.isBot) {
                         target.health--;
                         checkRoundEnd();
                     } else if (targetKey === gameState.role) {
-                        // ONLY the hit player reduces their own health and syncs
-                        target.health--;
-                        syncMyState(); 
+                        // LOCAL AUTHORITY: Only I can take damage for myself
+                        gameState.players[gameState.role].health--;
+                        console.log("Took damage! New health:", gameState.players[gameState.role].health);
+                        syncMyState(); // Update health in DB immediately
                         checkRoundEnd();
                     }
                 }
-                if (bolt.x < -100 || bolt.x > CANVAS_WIDTH + 100) bolt.active = false;
+
+                if (bolt.x < -50 || bolt.x > CANVAS_WIDTH + 50) bolt.active = false;
             });
             gameState.bolts = gameState.bolts.filter(b => b.active);
 
@@ -355,6 +366,7 @@
             ctx.translate(p.x + 20, p.y + 30);
             if (p.facing === -1) ctx.scale(-1, 1);
             
+            // Name tag
             ctx.scale(p.facing === -1 ? -1 : 1, 1);
             ctx.fillStyle = '#fff';
             ctx.font = 'bold 12px sans-serif';
@@ -362,14 +374,19 @@
             ctx.fillText(p.name || 'Player', 0, -50);
             if (p.facing === -1) ctx.scale(-1, 1);
 
+            // Toga
             ctx.fillStyle = '#fff';
             ctx.beginPath();
             ctx.moveTo(-15, 30); ctx.lineTo(15, 30); ctx.lineTo(10, -10); ctx.lineTo(-10, -10);
             ctx.fill();
+            // Head
             ctx.fillStyle = '#f3e5ab';
             ctx.beginPath(); ctx.arc(0, -25, 12, 0, Math.PI * 2); ctx.fill();
+            // Beard
             ctx.fillStyle = '#fff'; 
             ctx.beginPath(); ctx.moveTo(-10, -20); ctx.lineTo(10, -20); ctx.lineTo(0, 0); ctx.fill();
+            
+            // Glow border
             ctx.shadowBlur = 15; ctx.shadowColor = color; ctx.strokeStyle = color; ctx.lineWidth = 2;
             ctx.strokeRect(-20, -40, 40, 70);
             ctx.restore();
@@ -381,7 +398,11 @@
             ctx.beginPath();
             let bx = bolt.x; let by = bolt.y;
             ctx.moveTo(bx, by);
-            for(let i=0; i<5; i++) { bx += bolt.dir * 10; by += (Math.random() - 0.5) * 20; ctx.lineTo(bx, by); }
+            for(let i=0; i<5; i++) { 
+                bx += bolt.dir * 10; 
+                by += (Math.random() - 0.5) * 20; 
+                ctx.lineTo(bx, by); 
+            }
             ctx.stroke();
             ctx.restore();
         }
@@ -391,6 +412,8 @@
             grad.addColorStop(0, '#001'); grad.addColorStop(1, '#112');
             ctx.fillStyle = grad;
             ctx.fillRect(0,0,CANVAS_WIDTH, CANVAS_HEIGHT);
+            
+            // Floor
             ctx.fillStyle = '#223';
             ctx.fillRect(0, 360, CANVAS_WIDTH, 90);
 
@@ -426,8 +449,8 @@
             gameState.isBot = true; 
             gameState.players.p1.name = "You";
             gameState.players.p2.name = "Bot";
-            showScreen('playing');
             gameState.mode = 'playing';
+            showScreen('playing');
         };
 
         window.handleMove = (dir) => { 
