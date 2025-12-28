@@ -43,7 +43,7 @@
         const CANVAS_WIDTH = 800;
         const CANVAS_HEIGHT = 450;
         const MAX_HEALTH = 5;
-        const BOLT_SPEED = 0.6; // Changed to pixels per millisecond for timestamp sync
+        const BOLT_SPEED = 0.65; 
         const MOVE_SPEED = 5;
         const JUMP_FORCE = -15;
         const GRAVITY = 0.8;
@@ -61,6 +61,7 @@
             bolts: [],
             isBot: true,
             round: 1,
+            roundWinner: null,
             winner: null,
             lastHandledBoltId: null,
             opponentJoined: false
@@ -70,13 +71,14 @@
         const ctx = canvas.getContext('2d');
         
         function showScreen(screenId) {
-            const screens = ['menu', 'nameEntry', 'matchmaking', 'challenge', 'hud', 'mobileControls'];
+            const screens = ['menu', 'nameEntry', 'matchmaking', 'challenge', 'roundTransition', 'hud', 'mobileControls'];
             screens.forEach(id => {
                 const el = document.getElementById(id);
                 if (!el) return;
+                
                 if (id === screenId || (screenId === 'playing' && (id === 'hud' || id === 'mobileControls'))) {
                     el.classList.remove('hidden');
-                } else if (id === 'mobileControls' && window.innerWidth < 800 && (gameState.mode === 'playing' || gameState.mode === 'challenge')) {
+                } else if (id === 'mobileControls' && window.innerWidth < 800 && (gameState.mode === 'playing' || gameState.mode === 'challenge' || gameState.mode === 'roundTransition')) {
                     el.classList.remove('hidden');
                 } else {
                     el.classList.add('hidden');
@@ -127,7 +129,7 @@
                 const snap = await getDoc(matchmakingRef);
                 const data = snap.exists() ? snap.data() : null;
 
-                if (data && data.roomId && (Date.now() - data.timestamp < 10000)) {
+                if (data && data.roomId && (Date.now() - data.timestamp < 15000)) {
                     const rId = data.roomId;
                     await setDoc(matchmakingRef, { roomId: null, timestamp: Date.now() });
                     joinRoom(rId, 'p2');
@@ -154,7 +156,8 @@
                     p2: null,
                     state: gameState.players,
                     lastBolt: null,
-                    timestamp: Date.now()
+                    timestamp: Date.now(),
+                    round: 1
                 });
             } else {
                 gameState.players.p2.name = gameState.playerName;
@@ -175,22 +178,20 @@
                 const myRole = gameState.role;
 
                 if (data.state) {
-                    // Update opponent
                     if (data.state[otherRole]) {
-                        const remoteOpp = data.state[otherRole];
-                        // Preserve local properties if needed, but sync physical state
-                        gameState.players[otherRole] = { ...gameState.players[otherRole], ...remoteOpp };
+                        gameState.players[otherRole] = { ...gameState.players[otherRole], ...data.state[otherRole] };
                     }
-                    // Sync My meta state from DB
                     if (data.state[myRole]) {
                         gameState.players[myRole].score = data.state[myRole].score;
                         gameState.players[myRole].ready = data.state[myRole].ready;
-                        // ONLY take health from DB if we are currently NOT in playing mode (resets)
+                        // Health is synced from DB when we aren't in active combat
                         if (gameState.mode !== 'playing') {
                             gameState.players[myRole].health = data.state[myRole].health;
                         }
                     }
                 }
+                
+                if (data.round) gameState.round = data.round;
 
                 if (data.lastBolt && data.lastBolt.owner !== gameState.role && data.lastBolt.id !== gameState.lastHandledBoltId) {
                     spawnBolt(data.lastBolt.owner, data.lastBolt.startX, data.lastBolt.y, data.lastBolt.dir, data.lastBolt.startTime);
@@ -201,7 +202,12 @@
                     if (gameState.players.p1.ready && gameState.players.p2.ready) {
                         if (gameState.mode !== 'playing') showScreen('playing');
                         gameState.mode = 'playing';
-                    } else if (gameState.mode !== 'challenge') {
+                        gameState.roundWinner = null;
+                    } else if (gameState.roundWinner) {
+                         showScreen('roundTransition');
+                         document.getElementById('roundWinMsg').innerText = `${gameState.players[gameState.roundWinner].name} Wins Round ${gameState.round - 1}!`;
+                         gameState.mode = 'roundTransition';
+                    } else if (gameState.mode === 'matchmaking') {
                         showScreen('challenge');
                         document.getElementById('oppName').innerText = gameState.players[otherRole].name;
                         gameState.mode = 'challenge';
@@ -228,7 +234,8 @@
                 [`state.${gameState.role}.action`]: p.action,
                 [`state.${gameState.role}.facing`]: p.facing,
                 [`state.${gameState.role}.score`]: p.score,
-                [`state.${gameState.role}.ready`]: p.ready
+                [`state.${gameState.role}.ready`]: p.ready,
+                round: gameState.round
             });
         }
 
@@ -260,7 +267,8 @@
             
             if (keys['Space'] && !p.cooldown) {
                 const startTime = Date.now();
-                const startX = p.x + (p.facing * 20);
+                // FIX: Bolt comes from the front of the character (40px wide)
+                const startX = p.facing === 1 ? p.x + 40 : p.x;
                 spawnBolt(roleKey, startX, p.y + 20, p.facing, startTime);
                 if (!gameState.isBot) syncBolt(startX, p.y + 20, p.facing, startTime);
                 p.cooldown = true;
@@ -282,7 +290,8 @@
             else if (bot.x > target.x + 180) { bot.x -= 3; bot.facing = -1; }
             if (Math.random() < 0.02 && !bot.cooldown) {
                 const startTime = Date.now();
-                spawnBolt('p2', bot.x + (bot.facing * 20), bot.y + 20, bot.facing, startTime);
+                const startX = bot.facing === 1 ? bot.x + 40 : bot.x;
+                spawnBolt('p2', startX, bot.y + 20, bot.facing, startTime);
                 bot.cooldown = true;
                 setTimeout(() => bot.cooldown = false, 800);
             }
@@ -302,14 +311,12 @@
             });
 
             gameState.bolts.forEach((bolt) => {
-                // Time-based position sync
                 const elapsed = now - bolt.startTime;
                 bolt.currentX = bolt.startX + (bolt.dir * BOLT_SPEED * elapsed);
                 
                 const targetKey = bolt.owner === 'p1' ? 'p2' : 'p1';
                 const target = gameState.players[targetKey];
 
-                // Precise Hitbox
                 const hitBoxX = target.x;
                 const hitBoxY = target.y;
                 const hitBoxW = 40;
@@ -321,17 +328,16 @@
                     bolt.y > hitBoxY && 
                     bolt.y < hitBoxY + hitBoxH) {
                     
-                    bolt.active = false; // Vanish on hit
+                    bolt.active = false; 
 
                     if (gameState.isBot) {
                         target.health--;
                         target.lastHit = now;
                         checkRoundEnd();
                     } else if (targetKey === gameState.role) {
-                        // VICTIM AUTHORITY: Only the player who is hit reduces their own health
                         gameState.players[gameState.role].health--;
                         gameState.players[gameState.role].lastHit = now;
-                        syncMyState(); // Broadcast health reduction immediately
+                        syncMyState(); 
                         checkRoundEnd();
                     }
                 }
@@ -348,64 +354,68 @@
             if (gameState.players.p1.health <= 0 || gameState.players.p2.health <= 0) {
                 const winner = gameState.players.p1.health <= 0 ? 'p2' : 'p1';
                 gameState.players[winner].score++;
+                gameState.roundWinner = winner;
+                
                 if (gameState.players[winner].score >= 2) {
                     gameState.mode = 'gameover';
                     gameState.winner = winner;
                 } else {
-                    resetRound();
+                    prepareNextRound();
                 }
             }
         }
 
-        function resetRound() {
+        function prepareNextRound() {
+            // Stop combat
+            gameState.mode = 'roundTransition';
+            gameState.players.p1.ready = false;
+            gameState.players.p2.ready = false;
+            
+            // Logic reset happens on next ready accept
+            if (!gameState.isBot) {
+                syncMyState(); 
+            } else {
+                // In Bot mode just wait a bit and reset
+                setTimeout(() => {
+                    resetRoundData();
+                    gameState.mode = 'playing';
+                }, 2000);
+            }
+        }
+
+        function resetRoundData() {
             gameState.players.p1.health = MAX_HEALTH;
             gameState.players.p2.health = MAX_HEALTH;
             gameState.players.p1.x = 100;
             gameState.players.p2.x = 600;
             gameState.players.p1.vy = 0;
             gameState.players.p2.vy = 0;
-            gameState.players.p1.ready = true; // Stay ready for next round
-            gameState.players.p2.ready = true;
             gameState.bolts = [];
             gameState.round++;
-            if (!gameState.isBot) syncMyState();
         }
+
+        window.acceptNextRound = () => {
+            if (!gameState.role) return;
+            resetRoundData();
+            gameState.players[gameState.role].ready = true;
+            syncMyState();
+        };
 
         function drawZeus(p, color) {
             ctx.save();
             ctx.translate(p.x + 20, p.y + 30);
-            
-            // Hit flash effect
             const isHit = (Date.now() - p.lastHit < 150);
             const drawColor = isHit ? '#f00' : color;
-
             if (p.facing === -1) ctx.scale(-1, 1);
-            
-            // Name tag
             ctx.scale(p.facing === -1 ? -1 : 1, 1);
-            ctx.fillStyle = '#fff';
-            ctx.font = 'bold 12px sans-serif';
-            ctx.textAlign = 'center';
+            ctx.fillStyle = '#fff'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center';
             ctx.fillText(p.name || 'Player', 0, -50);
             if (p.facing === -1) ctx.scale(-1, 1);
-
-            // Toga
-            ctx.fillStyle = isHit ? '#f00' : '#fff';
-            ctx.beginPath();
-            ctx.moveTo(-15, 30); ctx.lineTo(15, 30); ctx.lineTo(10, -10); ctx.lineTo(-10, -10);
-            ctx.fill();
-            // Head
-            ctx.fillStyle = isHit ? '#f00' : '#f3e5ab';
-            ctx.beginPath(); ctx.arc(0, -25, 12, 0, Math.PI * 2); ctx.fill();
-            // Beard
-            ctx.fillStyle = '#fff'; 
-            ctx.beginPath(); ctx.moveTo(-10, -20); ctx.lineTo(10, -20); ctx.lineTo(0, 0); ctx.fill();
-            
-            // Glow border
-            ctx.shadowBlur = isHit ? 30 : 15; 
-            ctx.shadowColor = drawColor; 
-            ctx.strokeStyle = drawColor; 
-            ctx.lineWidth = 2;
+            ctx.fillStyle = isHit ? '#f00' : '#fff'; ctx.beginPath();
+            ctx.moveTo(-15, 30); ctx.lineTo(15, 30); ctx.lineTo(10, -10); ctx.lineTo(-10, -10); ctx.fill();
+            ctx.fillStyle = isHit ? '#f00' : '#f3e5ab'; ctx.beginPath(); ctx.arc(0, -25, 12, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.moveTo(-10, -20); ctx.lineTo(10, -20); ctx.lineTo(0, 0); ctx.fill();
+            ctx.shadowBlur = isHit ? 30 : 15; ctx.shadowColor = drawColor; ctx.strokeStyle = drawColor; ctx.lineWidth = 2;
             ctx.strokeRect(-20, -40, 40, 70);
             ctx.restore();
         }
@@ -414,15 +424,9 @@
             ctx.save();
             ctx.strokeStyle = '#0ff'; ctx.lineWidth = 3; ctx.shadowBlur = 20; ctx.shadowColor = '#0ff';
             ctx.beginPath();
-            let bx = bolt.currentX; 
-            let by = bolt.y;
+            let bx = bolt.currentX; let by = bolt.y;
             ctx.moveTo(bx, by);
-            // Jagged lightning effect
-            for(let i=0; i<5; i++) { 
-                bx += bolt.dir * 10; 
-                by += (Math.random() - 0.5) * 20; 
-                ctx.lineTo(bx, by); 
-            }
+            for(let i=0; i<5; i++) { bx += bolt.dir * 10; by += (Math.random() - 0.5) * 20; ctx.lineTo(bx, by); }
             ctx.stroke();
             ctx.restore();
         }
@@ -432,12 +436,10 @@
             grad.addColorStop(0, '#001'); grad.addColorStop(1, '#112');
             ctx.fillStyle = grad;
             ctx.fillRect(0,0,CANVAS_WIDTH, CANVAS_HEIGHT);
-            
-            // Floor
             ctx.fillStyle = '#223';
             ctx.fillRect(0, 360, CANVAS_WIDTH, 90);
 
-            if (gameState.mode === 'playing' || gameState.mode === 'challenge' || gameState.mode === 'gameover') {
+            if (gameState.mode === 'playing' || gameState.mode === 'challenge' || gameState.mode === 'gameover' || gameState.mode === 'roundTransition') {
                 drawZeus(gameState.players.p1, '#0af');
                 drawZeus(gameState.players.p2, '#f0a');
                 gameState.bolts.forEach(drawBolt);
@@ -450,11 +452,9 @@
             }
 
             if (gameState.mode === 'gameover') {
-                ctx.fillStyle = 'rgba(0,0,0,0.8)';
-                ctx.fillRect(0,0,CANVAS_WIDTH, CANVAS_HEIGHT);
-                ctx.fillStyle = '#fff';
-                ctx.font = 'bold 40px sans-serif'; ctx.textAlign = 'center';
-                ctx.fillText(`${gameState.players[gameState.winner].name} WINS!`, CANVAS_WIDTH/2, CANVAS_HEIGHT/2);
+                ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(0,0,CANVAS_WIDTH, CANVAS_HEIGHT);
+                ctx.fillStyle = '#fff'; ctx.font = 'bold 40px sans-serif'; ctx.textAlign = 'center';
+                ctx.fillText(`${gameState.players[gameState.winner].name} IS THE CHAMPION!`, CANVAS_WIDTH/2, CANVAS_HEIGHT/2);
                 ctx.font = '20px sans-serif'; ctx.fillText('Click to restart', CANVAS_WIDTH/2, CANVAS_HEIGHT/2 + 50);
             }
         }
@@ -545,6 +545,16 @@
             <p class="text-white text-xl mb-6 font-bold" id="oppName">Opponent</p>
             <button onclick="acceptChallenge()" class="w-full bg-pink-600 hover:bg-pink-500 text-white font-black py-6 px-6 rounded-xl text-2xl animate-pulse">ACCEPT CHALLENGE</button>
             <p class="mt-4 text-xs text-gray-500 uppercase tracking-widest">Both warriors must accept to begin</p>
+        </div>
+    </div>
+
+    <!-- Round Transition UI -->
+    <div id="roundTransition" class="hidden absolute inset-0 z-10 flex items-center justify-center bg-black/80 p-6">
+        <div class="bg-gray-900 border-2 border-yellow-500 p-8 rounded-2xl text-center max-w-sm w-full shadow-2xl">
+            <h2 class="text-3xl font-black text-white mb-2 italic uppercase tracking-widest text-yellow-500" id="roundWinMsg">Round Winner!</h2>
+            <p class="text-white mb-6 uppercase text-sm tracking-widest opacity-70">Prepare for the next bout</p>
+            <button onclick="acceptNextRound()" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-black py-6 px-6 rounded-xl text-2xl">READY FOR NEXT ROUND</button>
+            <p class="mt-4 text-xs text-gray-500 uppercase tracking-widest">Awaiting both players</p>
         </div>
     </div>
 
